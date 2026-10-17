@@ -6,6 +6,8 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"os"
+	"strings"
 	"sync"
 	"time"
 
@@ -16,11 +18,19 @@ import (
 	"costrict-router/internal/proxy"
 )
 
+const (
+	// EnvDisable401Retry 设为 1/true/yes/on 时关闭 401 自动重试与强制刷新功能。
+	EnvDisable401Retry = "COSTRICT_ROUTER_DISABLE_401_RETRY"
+	// forceRefreshCooldown 两次强制刷新之间的最小间隔，避免服务端短暂故障时反复刷 token。
+	forceRefreshCooldown = 30 * time.Second
+)
+
 type Service struct {
-	configPath string
-	cfg        config.Config
-	mu         sync.RWMutex
-	logger     *logx.Logger
+	configPath       string
+	cfg              config.Config
+	mu               sync.RWMutex
+	logger           *logx.Logger
+	lastForceRefresh time.Time
 }
 
 func New(configPath string, cfg config.Config, logger *logx.Logger) *Service {
@@ -73,6 +83,50 @@ func (s *Service) EnsureFreshToken(ctx context.Context) error {
 		s.logger.Infof(i18n.T("token refreshed; access token expires at: %s", "token 刷新成功，access token 过期时间: %s"), s.cfg.AccessTokenExpiresAt.Format(time.RFC3339))
 	}
 	return nil
+}
+
+func (s *Service) ForceRefreshToken(ctx context.Context) (bool, error) {
+	// 上游返回 401 时强制刷新 token；带冷却期，避免服务端短暂故障时反复刷新。
+	if is401RetryDisabled() {
+		return false, nil
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if !s.cfg.LoggedIn() {
+		return false, errors.New(i18n.T("not logged in; run costrict-router login first", "未登录，请先执行 costrict-router login"))
+	}
+	// 冷却期：短时间内已刷新过则跳过，可能是服务端问题，避免反复刷新 token。
+	if !s.lastForceRefresh.IsZero() && time.Since(s.lastForceRefresh) < forceRefreshCooldown {
+		if s.logger != nil {
+			s.logger.Warnf(i18n.T("401 retry: token refresh skipped due to cooldown (last refresh %s ago)", "401 重试：距离上次刷新不足 %s，跳过强制刷新"), time.Since(s.lastForceRefresh).Round(time.Second))
+		}
+		return false, nil
+	}
+	if s.logger != nil {
+		s.logger.Infof(i18n.T("401 from upstream; forcing token refresh", "上游返回 401，强制刷新 token"))
+	}
+	client := auth.NewClient(s.cfg.AuthParams())
+	tokens, err := client.RefreshToken(ctx, s.cfg.RefreshToken)
+	if err != nil {
+		return false, fmt.Errorf(i18n.T("force token refresh failed: %w", "强制刷新 token 失败: %w"), err)
+	}
+	if err := s.cfg.ApplyTokens(tokens); err != nil {
+		return false, err
+	}
+	if err := s.cfg.Save(s.configPath); err != nil {
+		return false, err
+	}
+	s.lastForceRefresh = time.Now()
+	if s.logger != nil {
+		s.logger.Infof(i18n.T("token force-refreshed; access token expires at: %s", "token 强制刷新成功，access token 过期时间: %s"), s.cfg.AccessTokenExpiresAt.Format(time.RFC3339))
+	}
+	return true, nil
+}
+
+func is401RetryDisabled() bool {
+	v := strings.TrimSpace(strings.ToLower(os.Getenv(EnvDisable401Retry)))
+	return v == "1" || v == "true" || v == "yes" || v == "on"
 }
 
 func (s *Service) StartRefreshLoop(ctx context.Context) {
