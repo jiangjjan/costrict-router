@@ -27,6 +27,10 @@ func (f *fakeTokens) EnsureFreshToken(context.Context) error {
 	return nil
 }
 
+func (f *fakeTokens) ForceRefreshToken(context.Context) (bool, error) {
+	return false, nil
+}
+
 func TestForwardChatAddsCostrictHeaders(t *testing.T) {
 	// 验证聊天转发会改写到真实上游路径，并补齐 CoStrict 必需请求头。
 	apiKey, apiKeyHash := localAPIKeyForTest(t)

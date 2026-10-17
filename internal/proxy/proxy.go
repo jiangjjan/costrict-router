@@ -27,6 +27,10 @@ import (
 type TokenProvider interface {
 	Config() config.Config
 	EnsureFreshToken(context.Context) error
+	// ForceRefreshToken 在收到上游 401 时强制刷新 access token。
+	// 返回 refreshed=true 表示 token 已更新，调用方应使用新 token 重试请求；
+	// 返回 refreshed=false 表示因冷却期或功能被禁用而未刷新。
+	ForceRefreshToken(context.Context) (refreshed bool, err error)
 }
 
 type Handler struct {
@@ -260,7 +264,7 @@ func (h *Handler) forwardCompat(w http.ResponseWriter, r *http.Request, codec co
 		return
 	}
 
-	resp, err := h.httpClient().Do(req)
+	resp, err := h.doUpstreamWith401Retry(r.Context(), r.Method, upstreamURL, chatBody, req.Header.Clone())
 	headersAt := time.Now()
 	if err != nil {
 		h.logUpstreamFailure(r, requestID, err)
@@ -331,9 +335,14 @@ func (h *Handler) streamCompatResponse(w http.ResponseWriter, r *http.Request, c
 	}
 
 	var upstreamStatus atomic.Int64
+	// 读取请求体以便重试时重建（req.Body 被消费后无法重读）。
+	streamBodyBytes, _ := io.ReadAll(req.Body)
+	streamURL := req.URL.String()
+	streamMethod := req.Method
+	streamHeader := req.Header.Clone()
 	go func() {
 		defer pw.Close()
-		resp, err := h.httpClient().Do(req)
+		resp, err := h.doUpstreamWith401Retry(r.Context(), streamMethod, streamURL, streamBodyBytes, streamHeader)
 		if err != nil {
 			h.logUpstreamFailure(r, requestID, err)
 			_, _ = pw.Write(compat.UpstreamErrorSSE(0, []byte(err.Error())))
@@ -452,7 +461,7 @@ func (h *Handler) forward(w http.ResponseWriter, r *http.Request, upstreamPath s
 			requestID, r.Method, r.URL.Path, upstreamURL, logx.RedactHeader(req.Header), logx.TruncateBody(bodyBytes, 32*1024))
 	}
 
-	resp, err := h.httpClient().Do(req)
+	resp, err := h.doUpstreamWith401Retry(r.Context(), r.Method, upstreamURL, bodyBytes, req.Header.Clone())
 	headersAt := time.Now()
 	if err != nil {
 		h.logUpstreamFailure(r, requestID, err)
@@ -517,7 +526,7 @@ func (h *Handler) handleModels(w http.ResponseWriter, r *http.Request) {
 	applyCostrictHeaders(req.Header, cfg, r)
 
 	requestID := req.Header.Get("X-Request-ID")
-	resp, err := h.httpClient().Do(req)
+	resp, err := h.doUpstreamWith401Retry(r.Context(), http.MethodGet, upstreamURL, nil, req.Header.Clone())
 	if err != nil {
 		if h.Logger != nil {
 			h.Logger.Warnf(i18n.T("upstream request failed method=%s path=%s request_id=%s err=%v", "上游请求失败 method=%s path=%s request_id=%s err=%v"), r.Method, r.URL.Path, requestID, err)
@@ -729,6 +738,82 @@ func validStatusToken(expected, got string) bool {
 		return false
 	}
 	return subtle.ConstantTimeCompare([]byte(got), []byte(expected)) == 1
+}
+
+// doUpstreamWith401Retry 执行上游请求，遇到 401 时按以下策略重试：
+//  1. 原样重试一次（可能是服务端瞬时问题）；
+//  2. 仍为 401 则强制刷新 token，再用新 token 重试一次。
+//
+// bodyBytes 用于重建请求体（http.Request.Body 被消费后无法重读）。
+// header 为请求头快照，token 刷新后会更新其中的 Authorization。
+func (h *Handler) doUpstreamWith401Retry(ctx context.Context, method, url string, bodyBytes []byte, header http.Header) (*http.Response, error) {
+	buildReq := func() (*http.Request, error) {
+		var body io.Reader
+		if bodyBytes != nil {
+			body = bytes.NewReader(bodyBytes)
+		}
+		req, err := http.NewRequestWithContext(ctx, method, url, body)
+		if err != nil {
+			return nil, err
+		}
+		for k, vs := range header {
+			for _, v := range vs {
+				req.Header.Add(k, v)
+			}
+		}
+		return req, nil
+	}
+
+	// 首次请求
+	req, err := buildReq()
+	if err != nil {
+		return nil, err
+	}
+	resp, err := h.httpClient().Do(req)
+	if err != nil {
+		return nil, err
+	}
+	if resp.StatusCode != http.StatusUnauthorized {
+		return resp, nil
+	}
+	resp.Body.Close()
+
+	if h.Logger != nil {
+		h.Logger.Warnf(i18n.T("upstream returned 401; retrying once", "上游返回 401，重试一次"))
+	}
+
+	// 第一次重试（原样）
+	req, err = buildReq()
+	if err != nil {
+		return nil, err
+	}
+	resp, err = h.httpClient().Do(req)
+	if err != nil {
+		return nil, err
+	}
+	if resp.StatusCode != http.StatusUnauthorized {
+		return resp, nil
+	}
+	resp.Body.Close()
+
+	// 仍 401：强制刷新 token 再重试
+	refreshed, refreshErr := h.Tokens.ForceRefreshToken(ctx)
+	if refreshErr != nil && h.Logger != nil {
+		h.Logger.Warnf(i18n.T("force token refresh failed: %v", "强制刷新 token 失败: %v"), refreshErr)
+	}
+	if refreshed {
+		cfg := h.Tokens.Config()
+		header.Set("Authorization", "Bearer "+cfg.AccessToken)
+		if h.Logger != nil {
+			h.Logger.Infof(i18n.T("token refreshed; retrying request with new token", "token 已刷新，使用新 token 重试请求"))
+		}
+	}
+
+	req, err = buildReq()
+	if err != nil {
+		return nil, err
+	}
+	return h.httpClient().Do(req)
 }
 
 func (h *Handler) httpClient() *http.Client {
