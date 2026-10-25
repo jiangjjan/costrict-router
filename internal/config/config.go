@@ -56,11 +56,21 @@ func DefaultPath() (string, error) {
 	if p := os.Getenv(EnvConfigPath); p != "" {
 		return p, nil
 	}
-	dir, err := os.UserConfigDir()
+	// 默认与可执行程序同级目录，便于绿色部署（exe 与 config.json 放一起即可运行）。
+	dir, err := exeDir()
 	if err != nil {
 		return "", err
 	}
-	return filepath.Join(dir, "costrict-router", "config.json"), nil
+	return filepath.Join(dir, "config.json"), nil
+}
+
+// exeDir 返回当前可执行程序所在目录。若无法解析则回退到当前工作目录。
+func exeDir() (string, error) {
+	exe, err := os.Executable()
+	if err != nil {
+		return os.Getwd()
+	}
+	return filepath.Dir(exe), nil
 }
 
 func CacheDir() (string, error) {
