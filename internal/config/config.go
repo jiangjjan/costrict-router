@@ -24,6 +24,11 @@ type Config struct {
 	// ModelPolicyOverrides 按模型名（不区分大小写）覆盖内置的上游兼容降级策略，
 	// 上游修复限制后用户改配置即可生效，无需等待新版本。键为模型 id，如 "Tencent-kimi-k2.6"。
 	ModelPolicyOverrides  map[string]compat.ModelPolicyOverride `json:"model_policy_overrides,omitempty"`
+	// ModelExtraParams 按模型名匹配（不区分大小写的子串匹配，"*" 匹配全部）
+	// 向转发到上游的请求体注入额外字段，便于针对特定模型优化推理行为。
+	// 例如为 GLM 关闭思考链：{"glm": {"thinking": {"type": "disabled"}}}。
+	// 若客户端已显式传入同名字段，以客户端为准，不覆盖。
+	ModelExtraParams map[string]json.RawMessage `json:"model_extra_params,omitempty"`
 	MachineCode           string                                `json:"machine_code"`
 	State                 string                                `json:"state"`
 	Provider              string                                `json:"provider"`
