@@ -233,6 +233,11 @@ func (h *Handler) forwardCompat(w http.ResponseWriter, r *http.Request, codec co
 		writeErr(http.StatusBadRequest, "invalid_request_error", err.Error())
 		return
 	}
+	chatBody, err = compat.ApplyModelExtraParams(chatBody, cfg.ModelExtraParams)
+	if err != nil {
+		writeErr(http.StatusBadRequest, "invalid_request_error", err.Error())
+		return
+	}
 	parallelToolCalls := compat.ChatParallelToolCalls(chatBody)
 
 	upstreamURL, err := joinURL(cfg.BaseURL, "/chat-rag/api/v1/chat/completions")
@@ -436,6 +441,11 @@ func (h *Handler) forward(w http.ResponseWriter, r *http.Request, upstreamPath s
 				return
 			}
 			bodyBytes, err = compat.ApplyUpstreamModelPolicy(bodyBytes, cfg.ModelPolicyOverrides)
+			if err != nil {
+				writeOpenAIError(w, http.StatusBadRequest, "invalid_request_error", err.Error())
+				return
+			}
+			bodyBytes, err = compat.ApplyModelExtraParams(bodyBytes, cfg.ModelExtraParams)
 			if err != nil {
 				writeOpenAIError(w, http.StatusBadRequest, "invalid_request_error", err.Error())
 				return

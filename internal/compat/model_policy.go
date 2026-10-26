@@ -99,6 +99,51 @@ func ChatParallelToolCalls(chatBody []byte) bool {
 	return *req.ParallelToolCalls
 }
 
+// ApplyModelExtraParams 根据配置中的 model_extra_params 向请求体注入额外字段。
+// 匹配规则：对每个配置键做不区分大小写的子串匹配（"*" 匹配全部模型），
+// 命中后将对应 JSON 对象中的字段合并进请求体；客户端已显式传入的同名字段不被覆盖。
+// 多个匹配键的字段会依次合并，顺序由 map 遍历决定（同名字段以先匹配到的为准）。
+func ApplyModelExtraParams(chatBody []byte, extraParams map[string]json.RawMessage) ([]byte, error) {
+	if len(extraParams) == 0 {
+		return chatBody, nil
+	}
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(chatBody, &fields); err != nil {
+		return nil, err
+	}
+	if fields == nil {
+		fields = map[string]json.RawMessage{}
+	}
+	var model string
+	_ = json.Unmarshal(fields["model"], &model)
+	modelLower := strings.ToLower(model)
+
+	for pattern, raw := range extraParams {
+		if !matchModelPattern(pattern, modelLower) {
+			continue
+		}
+		var inject map[string]json.RawMessage
+		if err := json.Unmarshal(raw, &inject); err != nil {
+			// 配置值不是合法对象则跳过，避免单个错误条目阻断整个请求。
+			continue
+		}
+		for k, v := range inject {
+			if _, exists := fields[k]; !exists {
+				fields[k] = v
+			}
+		}
+	}
+	return jsonMarshal(fields)
+}
+
+// matchModelPattern 判断模型名是否命中配置键："*" 命中全部，否则不区分大小写子串匹配。
+func matchModelPattern(pattern, modelLower string) bool {
+	if pattern == "*" {
+		return true
+	}
+	return strings.Contains(modelLower, strings.ToLower(pattern))
+}
+
 func forceCompatibleAutoToolChoice(fields map[string]json.RawMessage) {
 	raw, ok := fields["tool_choice"]
 	if !ok {
