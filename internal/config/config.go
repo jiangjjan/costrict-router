@@ -56,27 +56,28 @@ func DefaultPath() (string, error) {
 	if p := os.Getenv(EnvConfigPath); p != "" {
 		return p, nil
 	}
-	// 绿色部署优先：可执行程序同级目录存在 config.json 则直接使用。
-	if dir, err := exeDir(); err == nil {
-		peer := filepath.Join(dir, "config.json")
-		if _, err := os.Stat(peer); err == nil {
-			return peer, nil
-		}
-	}
-	// 同级未找到时回退到旧版默认位置（系统用户配置目录），
-	// 保证已登录的升级用户不丢失 access_token / refresh_token。
-	if dir, err := os.UserConfigDir(); err == nil {
-		legacy := filepath.Join(dir, "costrict-router", "config.json")
-		if _, err := os.Stat(legacy); err == nil {
-			return legacy, nil
-		}
-	}
-	// 两者都不存在时仍返回 exe 同级路径（首次运行、首次部署的默认落盘位置）。
-	dir, err := exeDir()
+	dir, err := os.UserConfigDir()
 	if err != nil {
 		return "", err
 	}
-	return filepath.Join(dir, "config.json"), nil
+	return filepath.Join(dir, "costrict-router", "config.json"), nil
+}
+
+// DefaultModelExtraPath 返回外置模型额外参数文件的默认路径：
+// 可执行程序同级目录下的 model_extra.json。
+// 文件形状与 config.json 中的 model_extra_params 完全相同：
+// {"glm": {"thinking": {"type": "disabled"}}, "*": {"max_tokens": 8192}}。
+// 文件不存在时（首次部署）返回空路径且 error==nil，调用方可跳过加载。
+func DefaultModelExtraPath() (string, bool) {
+	dir, err := exeDir()
+	if err != nil {
+		return "", false
+	}
+	p := filepath.Join(dir, "model_extra.json")
+	if _, err := os.Stat(p); err != nil {
+		return "", false
+	}
+	return p, true
 }
 
 // exeDir 返回当前可执行程序所在目录。若无法解析则回退到当前工作目录。
@@ -134,7 +135,36 @@ func Load(path string) (*Config, error) {
 		return nil, fmt.Errorf("配置文件 JSON 无效: %w", err)
 	}
 	cfg.ApplyDefaults()
+	cfg.LoadModelExtraOverrides()
 	return &cfg, nil
+}
+
+// LoadModelExtraOverrides 读取 exe 同级的 model_extra.json 并合并进 Config.ModelExtraParams。
+// 外置文件与主 config.json 中的 model_extra_params 同名键时，**外置文件优先覆盖**（后加载），
+// 这样用户可以只改外置文件而不碰主配置里的 access_token 等敏感字段。
+func (c *Config) LoadModelExtraOverrides() {
+	p, ok := DefaultModelExtraPath()
+	if !ok {
+		return
+	}
+	data, err := os.ReadFile(p)
+	if err != nil {
+		// 读失败（权限/损坏）不阻断主服务启动，只略过外置文件。
+		return
+	}
+	var extra map[string]json.RawMessage
+	if err := json.Unmarshal(data, &extra); err != nil {
+		return
+	}
+	if len(extra) == 0 {
+		return
+	}
+	if c.ModelExtraParams == nil {
+		c.ModelExtraParams = map[string]json.RawMessage{}
+	}
+	for k, v := range extra {
+		c.ModelExtraParams[k] = v
+	}
 }
 
 func Default() Config {
