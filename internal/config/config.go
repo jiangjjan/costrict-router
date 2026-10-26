@@ -56,7 +56,22 @@ func DefaultPath() (string, error) {
 	if p := os.Getenv(EnvConfigPath); p != "" {
 		return p, nil
 	}
-	// 默认与可执行程序同级目录，便于绿色部署（exe 与 config.json 放一起即可运行）。
+	// 绿色部署优先：可执行程序同级目录存在 config.json 则直接使用。
+	if dir, err := exeDir(); err == nil {
+		peer := filepath.Join(dir, "config.json")
+		if _, err := os.Stat(peer); err == nil {
+			return peer, nil
+		}
+	}
+	// 同级未找到时回退到旧版默认位置（系统用户配置目录），
+	// 保证已登录的升级用户不丢失 access_token / refresh_token。
+	if dir, err := os.UserConfigDir(); err == nil {
+		legacy := filepath.Join(dir, "costrict-router", "config.json")
+		if _, err := os.Stat(legacy); err == nil {
+			return legacy, nil
+		}
+	}
+	// 两者都不存在时仍返回 exe 同级路径（首次运行、首次部署的默认落盘位置）。
 	dir, err := exeDir()
 	if err != nil {
 		return "", err
